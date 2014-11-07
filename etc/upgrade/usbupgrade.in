@@ -1,0 +1,289 @@
+#!/bin/bash
+
+if [ -n "${__UPGRADE_USBUPGRADE_IN__}" ]; then
+	return
+else
+	__UPGRADE_USBUPGRADE_IN__="$0"
+fi
+
+. ${__ROOTFS__}/etc/upgrade/upgrade.in
+
+
+readonly file_usbupgrade_auto=${dir_usb_upgrade}/.usbupgrade_auto
+
+usbupgrade_echo_logger() {
+	echo "usbupgrade" "$@"
+	logger "usbupgrade" "$@"
+}
+
+
+#
+#$1:sys or sata is blink
+#$2:other init state
+#
+usbupgrade_blink_one() {
+	local blink=$1
+	local state=$2
+	local sysled=${__ROOTFS__}/usr/sbin/sysled
+	local fixed
+
+	if [ "sys" == "${blink}" ]; then
+		fixed="sata"
+	else
+		fixed="sys"
+	fi
+
+	${sysled} ${fixed} ${state}
+
+	for ((;;)); do
+		sleep 1
+
+		if [ "on" == "${state}" ]; then
+			state="off"
+		else
+			state="on"
+		fi
+
+		${sysled} ${blink} ${state}
+	done
+}
+
+usbupgrade_ok() {
+	local state="on"
+
+	for ((;;)); do
+		sleep 1
+
+		sysled sys ${state}
+		if [ "on" == "${state}" ]; then
+			state="off"
+		else
+			state="on"
+		fi
+		sysled sata ${state}
+	done
+}
+
+usbupgrade_fail() {
+	local state="on"
+
+	for ((;;)); do
+		sleep 1
+
+		if [ "on" == "${state}" ]; then
+			state="off"
+		else
+			state="on"
+		fi
+
+		sysled sys ${state}
+		sysled sata ${state}
+	done
+}
+
+#
+#$1:partition
+#$2:file
+#
+usbupgrade_bydd() {
+	local partition=$1
+	local file=$2
+	local err=0
+	local tag
+
+	dd if=${file} of=${partition} > /dev/null 2>&1; err=$?
+
+	tag=$(get_error_tag ${err})
+	usbupgrade_echo_logger "${tag}: ${partition} by ${file}"
+
+	return ${err}
+}
+
+#
+#$1:idx
+#
+usbupgrade_rootfs() {
+	local idx=$1
+	local src=${dir_usb_upgrade_rootfs}
+	local dst=$(rootfs_dir ${idx})
+	local err=0
+	local tag
+
+	rm -fr ${dst}/*; sync
+	cp -fpR ${src}/* ${dst}; err=$?; sync
+
+	local tag
+	if [ "0" != "${err}" ]; then
+		tag="ERROR[${err}]"
+	else
+		tag="OK"
+	fi
+	usbupgrade_echo_logger "${tag}: copy ${src} to ${dst}"
+
+	return ${err}
+}
+
+usbupgrade_phase1() {
+	local err=0
+
+	#
+	# upgrade bin
+	#
+	local name
+	for name in ${!dev_emmc_bin[*]}; do
+		local file=${dir_usb_upgrade}/${name}
+		local partition=${dev_emmc_bin[${name}]}
+
+		usbupgrade_bydd ${partition} ${file}; err=$?
+		if ((0!=err)); then
+			return ${err}
+		fi
+	done
+
+	#
+	# remount rootfs0
+	#
+	remount_rootfs 0; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	#
+	# upgrade rootfs0
+	#
+	usbupgrade_rootfs 0; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	#
+	# setup rootfs0's rsync version
+	#
+	rsync_setup_by 0; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	#
+	# upgrade buddy
+	#
+	usbupgrade_rootfs ${buddy}; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	bootm rootfs=${buddy}; sync
+	usbupgrade_echo_logger "${info} ok, will reboot..."
+	${__ROOTFS__}/usr/sbin/sysreboot
+}
+
+usbupgrade_phase2() {
+	local buddy=$(rootfs_buddy)
+	local err=0
+
+	usbupgrade_rootfs ${buddy}; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	${__ROOTFS__}/etc/upgrade/upgrade_ap.sh 'usbupgrade'; err=$?
+	if ((0!=err)); then
+		return ${err}
+	fi
+
+	bootm rootfs=${buddy};
+}
+
+usbupgrade_need() {
+	local name
+	local file
+
+	if [ ! -d "${dir_usb_upgrade_rootfs}" ]; then
+		return ${e_noexist}
+	fi
+
+	for name in ${!dev_emmc_bin[*]}; do
+		file=${dir_usb_upgrade}/${name}
+
+		if [ ! -f "${file}" ]; then
+			return ${e_noexist}
+		fi
+	done
+
+	echo "need"
+}
+
+#
+# if do usb upgrade, return ${e_usbupgrade}
+#
+usbupgrade() {
+	local buddy=$(rootfs_buddy)
+	local err=0
+	local tag
+	local info
+
+	#
+	# no usb
+	#
+	if [[ ! -f "${file_usbupgrade_auto}" || \
+			"need" != "$(usbupgrade_need)" ]]; then
+		return
+	fi
+
+	local version=$(cat ${dir_usb_upgrade_rootfs}/etc/.version)
+	local version0=$(get_rootfs_version 0)
+	local version_current=$(get_rootfs_version)
+	local version_buddy=$(get_buddy_version)
+
+	if [[ 	"${version}" == "${version0}" && \
+			"${version}" == "${version_current}" && \
+			"${version}" == "${version_buddy}" ]]; then
+		usbupgrade_echo_logger \
+			"all rootfs is version:${version}, needn't to upgrade"
+
+		#
+		# todo: check files
+		#
+
+		return
+	elif [ "${version}" != "${version0}" ]; then
+		info="version:${version} phase 1"
+		usbupgrade_echo_logger "${info}..."
+
+		#
+		# upgrade boot/kernel/rootfs0/2
+		#
+		usbupgrade_phase1; err=$?
+
+		tag=$(get_error_tag ${err})
+		usbupgrade_echo_logger "${tag}: ${info}"
+
+		if ((0!=err)); then
+			usbupgrade_fail
+		fi
+	elif [ "${version}" != "${version_buddy}" ]; then
+		info="version:${version} phase 2"
+		usbupgrade_echo_logger "${info}..."
+
+		#
+		# upgrade rootfs1
+		#
+		usbupgrade_phase2; err=$?
+
+		tag=$(get_error_tag ${err})
+		usbupgrade_echo_logger "${tag}: ${info}"
+
+		if ((0!=err)); then
+			usbupgrade_fail
+		fi
+	else
+		usbupgrade_echo_logger "OK"
+
+		#
+		# upgrade ok
+		#
+		usbupgrade_ok
+	fi
+
+	return ${e_usbupgrade}
+}
